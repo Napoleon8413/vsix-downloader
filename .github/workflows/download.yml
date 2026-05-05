@@ -1,0 +1,145 @@
+name: VSIX Downloader (via Link)
+
+on:
+  workflow_dispatch:
+    inputs:
+      marketplace_url:
+        description: 'Marketplace extension URL'
+        required: true
+        type: string
+      version:
+        description: 'Version (default: latest)'
+        required: false
+        type: string
+        default: 'latest'
+      filename:
+        description: 'Output filename (optional)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  download-vsix:
+    name: Download VSIX Extension
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install requests
+
+      - name: Download VSIX File
+        id: download
+        run: |
+          python3 << 'PYEOF'
+          import requests, sys, os, re
+          from urllib.parse import urlparse, parse_qs
+
+          MARKETPLACE_URL = os.environ['MARKETPLACE_URL'].strip()
+          VERSION = os.environ.get('VERSION', 'latest').strip() or 'latest'
+          CUSTOM_FILENAME = os.environ.get('FILENAME', '').strip()
+
+          parsed = urlparse(MARKETPLACE_URL)
+          if 'itemName' in parsed.query:
+              item_name = parse_qs(parsed.query)['itemName'][0]
+          else:
+              path_parts = [p for p in parsed.path.split('/') if p]
+              if path_parts and path_parts[-1] != 'items':
+                  item_name = path_parts[-1]
+              else:
+                  print("❌ Could not extract extension ID from the URL.")
+                  sys.exit(1)
+
+          parts = item_name.split('.')
+          if len(parts) < 2:
+              print(f"❌ Invalid extension ID: {item_name}")
+              sys.exit(1)
+          publisher = parts[0]
+          extension = '.'.join(parts[1:])
+
+          print(f"Publisher: {publisher}")
+          print(f"Extension: {extension}")
+
+          if VERSION == 'latest':
+              try:
+                  api_url = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery"
+                  payload = {
+                      "filters": [{
+                          "criteria": [{"filterType": 7, "value": f"{publisher}.{extension}"}]
+                      }],
+                      "flags": 131
+                  }
+                  resp = requests.post(api_url, json=payload, headers={
+                      "Accept": "application/json;api-version=3.0-preview.1",
+                      "Content-Type": "application/json"
+                  }, timeout=15)
+                  data = resp.json()
+                  ext_info = data['results'][0]['extensions'][0]
+                  VERSION = ext_info['versions'][0]['version']
+                  print(f"Latest version: {VERSION}")
+              except Exception as e:
+                  print(f"⚠️ Failed to fetch version: {e}")
+                  VERSION = 'latest'
+
+          url = f"https://{publisher}.gallery.vsassets.io/_apis/public/gallery/publisher/{publisher}/extension/{extension}/{VERSION}/assetbyname/Microsoft.VisualStudio.Services.VSIXPackage"
+          print(f"Download URL: {url}")
+
+          headers = {"User-Agent": "Mozilla/5.0"}
+          try:
+              resp = requests.get(url, headers=headers, stream=True, timeout=60)
+              resp.raise_for_status()
+          except Exception:
+              alt_url = f"https://marketplace.visualstudio.com/_apis/public/gallery/publishers/{publisher}/vsextensions/{extension}/{VERSION}/vspackage"
+              resp = requests.get(alt_url, headers=headers, stream=True, timeout=60)
+              resp.raise_for_status()
+
+          os.makedirs("downloads", exist_ok=True)
+          if CUSTOM_FILENAME:
+              fname = CUSTOM_FILENAME
+              if not fname.endswith('.vsix'):
+                  fname += '.vsix'
+          else:
+              fname = f"{publisher}.{extension}-{VERSION}.vsix"
+
+          filepath = f"downloads/{fname}"
+          total = 0
+          with open(filepath, 'wb') as f:
+              for chunk in resp.iter_content(8192):
+                  f.write(chunk)
+                  total += len(chunk)
+          size_mb = total / (1024 * 1024)
+          print(f"✅ Downloaded: {fname} ({size_mb:.2f} MB)")
+
+          with open('/tmp/vsix_meta.txt', 'w') as f:
+              f.write(f"{fname}\n{size_mb:.2f}\n{VERSION}\n{publisher}.{extension}\n")
+          PYEOF
+        env:
+          MARKETPLACE_URL: ${{ github.event.inputs.marketplace_url }}
+          VERSION: ${{ github.event.inputs.version }}
+          FILENAME: ${{ github.event.inputs.filename }}
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add ./downloads/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          FILENAME=$(sed -n '1p' /tmp/vsix_meta.txt)
+          SIZE_MB=$(sed -n '2p' /tmp/vsix_meta.txt)
+          VERSION=$(sed -n '3p' /tmp/vsix_meta.txt)
+          EXT_ID=$(sed -n '4p' /tmp/vsix_meta.txt)
+          git commit -m "Download $EXT_ID v$VERSION ($SIZE_MB MB)"
+          git pull --rebase origin main
+          git push origin main
