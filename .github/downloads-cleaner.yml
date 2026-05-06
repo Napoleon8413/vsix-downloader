@@ -1,0 +1,37 @@
+name: Clean Downloads Folder
+
+on:
+  workflow_dispatch:
+
+jobs:
+  clean:
+    name: Delete all downloaded VSIX files
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Remove downloads folder
+        run: |
+          if [ -d "downloads" ]; then
+            rm -rf downloads
+            echo "Downloads folder removed."
+          else
+            echo "Downloads folder does not exist."
+          fi
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Clean downloads folder"
+          git pull --rebase origin main
+          git push origin main
